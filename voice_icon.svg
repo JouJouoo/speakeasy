@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="Minimal monochrome voice chat app icon">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#fff"/>
+      <stop offset="1" stop-color="#f0f1f2"/>
+    </linearGradient>
+    <linearGradient id="bubble" x1="0" y1="0" x2="0.9" y2="1">
+      <stop offset="0" stop-color="#fff"/>
+      <stop offset="1" stop-color="#f5f6f7"/>
+    </linearGradient>
+    <linearGradient id="mic" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#55585c"/>
+      <stop offset=".46" stop-color="#17191c"/>
+      <stop offset="1" stop-color="#08090b"/>
+    </linearGradient>
+    <linearGradient id="bar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#777b80"/>
+      <stop offset="1" stop-color="#9a9da1"/>
+    </linearGradient>
+    <filter id="tileShadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="10" stdDeviation="16" flood-color="#000" flood-opacity=".12"/>
+    </filter>
+    <filter id="softShadow" x="-15%" y="-15%" width="130%" height="140%">
+      <feDropShadow dx="0" dy="5" stdDeviation="8" flood-color="#565b60" flood-opacity=".18"/>
+    </filter>
+  </defs>
+  <!-- Rounded app tile -->
+  <rect x="58" y="58" width="908" height="908" rx="218" fill="url(#tile)" stroke="#e7e8ea" stroke-width="2" filter="url(#tileShadow)"/>
+  <!-- Speech bubble with a short lower-left tail -->
+  <path d="M419 211h186c147 0 251 104 251 250v55c0 150-105 255-255 255H414c-32 0-55 8-82 25-50 31-106 58-142 66-23 5-35-12-22-31 30-43 46-81 50-108 2-13-2-22-13-30-54-42-84-106-84-188v-44c0-146 104-250 250-250h48Z" fill="url(#bubble)" stroke="#e3e5e7" stroke-width="3" filter="url(#softShadow)"/>
+  <!-- Sound bars -->
+  <g fill="url(#bar)" stroke="#62666a" stroke-width="2">
+    <rect x="261" y="439" width="26" height="61" rx="13"/>
+    <rect x="304" y="408" width="26" height="122" rx="13"/>
+    <rect x="347" y="370" width="26" height="192" rx="13"/>
+    <rect x="651" y="370" width="26" height="192" rx="13"/>
+    <rect x="694" y="408" width="26" height="122" rx="13"/>
+    <rect x="737" y="439" width="26" height="61" rx="13"/>
+  </g>
+  <!-- Microphone capsule -->
+  <rect x="427" y="291" width="170" height="268" rx="84" fill="url(#mic)" stroke="#5a5d61" stroke-width="3"/>
+  <!-- Microphone cradle and stem -->
+  <path d="M388 470v24c0 73 49 130 119 139v35h-38c-13 0-23 10-23 23v0c0 12 10 22 23 22h108c13 0 23-10 23-22v0c0-13-10-23-23-23h-38v-35c70-9 119-66 119-139v-24c0-12-9-21-21-21s-21 9-21 21v24c0 58-39 96-96 96s-96-38-96-96v-24c0-12-9-21-21-21s-21 9-21 21Z" fill="url(#mic)" stroke="#17191c" stroke-width="3" stroke-linejoin="round" filter="url(#softShadow)"/>
+  <path d="M409 468v26c0 57 40 98 98 98s98-41 98-98v-26" fill="none" stroke="#777a7e" stroke-opacity=".42" stroke-width="2"/>
+</svg>

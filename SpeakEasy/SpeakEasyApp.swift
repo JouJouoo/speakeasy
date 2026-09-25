@@ -923,11 +923,11 @@ struct MainView: View {
                 }
             }
             .contentShape(Rectangle())
-            .highPriorityGesture(
-                    DragGesture(minimumDistance: 14)
+            .simultaneousGesture(
+                    DragGesture(minimumDistance: 24)
                         .onChanged { value in
                             guard !isSelectingTurns else { return }
-                            guard abs(value.translation.width) > abs(value.translation.height) else { return }
+                            guard abs(value.translation.width) > max(24, abs(value.translation.height) * 1.7) else { return }
                             if swipeDragTurnID != turn.id {
                                 swipeDragTurnID = turn.id
                                 swipeStartOffset = openSwipeTurnID == turn.id ? swipeOffset : 0
@@ -937,8 +937,11 @@ struct MainView: View {
                         }
                         .onEnded { value in
                             guard !isSelectingTurns else { return }
-                            guard abs(value.translation.width) > abs(value.translation.height) else { return }
-                            let shouldOpenDelete = value.translation.width > 36
+                            guard abs(value.translation.width) > max(24, abs(value.translation.height) * 1.7) else {
+                                swipeDragTurnID = nil
+                                return
+                            }
+                            let shouldOpenDelete = value.translation.width > 44
                             withAnimation(.spring(response: 0.32, dampingFraction: 0.88)) {
                                 swipeOffset = shouldOpenDelete ? swipeRevealWidth : 0
                                 openSwipeTurnID = swipeOffset == 0 ? nil : turn.id

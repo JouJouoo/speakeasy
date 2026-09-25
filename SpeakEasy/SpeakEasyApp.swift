@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import Security
 import Speech
 import AVFoundation
@@ -541,11 +542,14 @@ private struct WordTokenButton: View {
         .buttonStyle(.plain)
         .disabled(lookupWord.isEmpty)
         .popover(isPresented: popoverBinding, attachmentAnchor: .rect(.bounds), arrowEdge: .top) {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
+            VStack(alignment: .center, spacing: 12) {
+                ZStack(alignment: .trailing) {
                     Text(library.activeWord)
                         .font(.system(size: 18, weight: .semibold, design: .serif))
-                    Spacer()
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                        .frame(maxWidth: .infinity, minHeight: 28)
+                        .padding(.horizontal, 30)
                     Button { library.dismissWordLookup(anchor: anchorID) } label: {
                         Image(systemName: "xmark.circle.fill")
                             .foregroundStyle(.tertiary)
@@ -554,22 +558,30 @@ private struct WordTokenButton: View {
                     .accessibilityLabel("关闭")
                 }
                 if library.isWordLookupLoading {
-                    HStack(spacing: 8) {
+                    VStack(spacing: 8) {
                         ProgressView()
                         Text("正在查询…")
                             .font(.system(size: 14))
                             .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
                     }
+                    .frame(maxWidth: .infinity)
                 } else if let info = library.activeWordInfo {
                     Text(info.ipa)
                         .font(.system(size: 15))
                         .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity)
                     Text(info.meaning)
                         .font(.system(size: 15))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity)
                 } else if let error = library.wordLookupError {
                     Text(error)
                         .font(.system(size: 14))
                         .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity)
                     Button("重试") {
                         library.startWordLookup(lookupWord, anchor: anchorID)
                     }
@@ -577,7 +589,7 @@ private struct WordTokenButton: View {
                 }
             }
             .padding(16)
-            .frame(width: 270, alignment: .leading)
+            .frame(width: 270, alignment: .center)
             .presentationCompactAdaptation(.popover)
         }
     }
@@ -666,6 +678,8 @@ struct MainView: View {
     @StateObject private var speech = SpeechInputController()
     @State private var toast: String?
     @State private var ignoreLateSpeechTranscript = false
+    @State private var isKeyboardVisible = false
+    @State private var activePhraseMenuID: UUID?
     @State private var isSelectingTurns = false
     @State private var selectedTurnIDs: Set<UUID> = []
     @State private var openSwipeTurnID: UUID?
@@ -686,6 +700,15 @@ struct MainView: View {
         case "dark": .dark
         default: nil
         }
+    }
+
+    private var inputIsEmpty: Bool {
+        input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var latestTurnScrollKey: String {
+        guard let latest = library.turns.last else { return "empty" }
+        return "\(library.turns.count)-\(latest.id.uuidString)-\(latest.isLoading)-\(latest.phrases.count)-\(latest.message ?? "")"
     }
 
     var body: some View {
@@ -758,18 +781,32 @@ struct MainView: View {
                 .padding(.bottom, 10)
                 .background(canvas)
 
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 28) {
-                        ForEach(Array(library.turns.enumerated()), id: \.element.id) { turnIndex, turn in
-                            historyRow(turn, index: turnIndex, total: library.turns.count)
+                ScrollViewReader { scrollProxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 28) {
+                            ForEach(Array(library.turns.enumerated()), id: \.element.id) { turnIndex, turn in
+                                historyRow(turn, index: turnIndex, total: library.turns.count)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 1, alignment: .topLeading)
+                        .padding(.horizontal, 26)
+                        .padding(.top, 18)
+                        .padding(.bottom, 28)
+
+                        Color.clear
+                            .frame(height: 1)
+                            .id("history-bottom")
+                    }
+                    .scrollIndicators(.hidden)
+                    .scrollDismissesKeyboard(.interactively)
+                    .onChange(of: latestTurnScrollKey) { _, _ in
+                        DispatchQueue.main.async {
+                            withAnimation(.easeOut(duration: 0.25)) {
+                                scrollProxy.scrollTo("history-bottom", anchor: .bottom)
+                            }
                         }
                     }
-                    .frame(maxWidth: .infinity, minHeight: 1, alignment: .topLeading)
-                    .padding(.horizontal, 26)
-                    .padding(.top, 18)
-                    .padding(.bottom, 28)
                 }
-                .scrollIndicators(.hidden)
             }
             .background(canvas.ignoresSafeArea())
             .safeAreaInset(edge: .bottom, spacing: 0) { inputBar }
@@ -787,6 +824,12 @@ struct MainView: View {
             if !ignoreLateSpeechTranscript && !transcript.isEmpty {
                 input = transcript
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+            isKeyboardVisible = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            isKeyboardVisible = false
         }
     }
 
@@ -851,16 +894,25 @@ struct MainView: View {
                             swipeOffset = 0
                         }
                     } label: {
-                        VStack(spacing: 6) {
-                            Image(systemName: "trash")
-                                .font(.system(size: 16, weight: .medium))
-                            Text("删除")
-                                .font(.system(size: 12, weight: .medium))
+                        HStack(spacing: 0) {
+                            Spacer(minLength: 0)
+                            VStack(spacing: 4) {
+                                Image(systemName: "trash")
+                                    .font(.system(size: 15, weight: .semibold))
+                                Text("删除")
+                                    .font(.system(size: 11, weight: .semibold))
+                            }
+                            .foregroundStyle(.white)
+                            .frame(width: 68, height: 54)
+                            .background(
+                                Color(red: 0.84, green: 0.27, blue: 0.27),
+                                in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            )
+                            .shadow(color: Color.red.opacity(0.12), radius: 5, y: 2)
                         }
-                        .foregroundStyle(.white)
-                        .frame(width: 76)
+                        .padding(.trailing, 16)
+                        .frame(width: swipeRevealWidth)
                         .frame(maxHeight: .infinity)
-                        .background(Color.red)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
@@ -944,44 +996,64 @@ struct MainView: View {
                 TextField("", text: $input, axis: .vertical)
                     .font(.system(size: 16))
                     .lineLimit(1...4)
-                    .multilineTextAlignment(.center)
+                    .multilineTextAlignment(.leading)
                     .submitLabel(.send)
                     .focused($inputFocused)
                     .onSubmit(submit)
-                    .padding(.vertical, 12)
-
-                Button {
-                    inputFocused = false
-                    if speech.isRecording { speech.stop() }
-                    else {
-                        ignoreLateSpeechTranscript = false
-                        speech.start()
+                    .onChange(of: input) { _, newValue in
+                        guard newValue.contains("\n") else { return }
+                        input = newValue.replacingOccurrences(of: "\n", with: " ")
+                        submit()
                     }
-                } label: {
-                    Image(systemName: speech.isRecording ? "waveform" : "mic")
-                        .font(.system(size: 18, weight: .medium))
-                        .foregroundStyle(speech.isRecording ? Color(uiColor: .systemBackground) : secondary)
-                        .frame(width: 42, height: 42)
-                        .background(speech.isRecording ? ink : control, in: Circle())
-                }
-                .accessibilityLabel(speech.isRecording ? "停止语音输入" : "开始语音输入")
-                .contextMenu {
-                    Button("DeepSeek 设置", systemImage: "key") { settingsPresented = true }
-                }
+                    .padding(.leading, 12)
+                    .padding(.vertical, 12)
+                    .frame(minHeight: 54)
 
-                Button(action: submit) {
-                    Image(systemName: library.isLoading ? "ellipsis" : "arrow.up")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(Color(uiColor: .systemBackground))
-                        .frame(width: 42, height: 42)
-                        .background(ink, in: Circle())
-                }
-                .disabled(library.isLoading || input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                .opacity(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0.45 : 1)
-                .accessibilityLabel("发送")
-                .padding(.trailing, 8)
+                    Button {
+                        inputFocused = false
+                        if speech.isRecording { speech.stop() }
+                        else {
+                            ignoreLateSpeechTranscript = false
+                            speech.start()
+                        }
+                    } label: {
+                        Image(systemName: speech.isRecording ? "waveform" : "mic")
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundStyle(speech.isRecording ? Color(uiColor: .systemBackground) : secondary)
+                            .frame(width: 44, height: 44)
+                            .background(speech.isRecording ? ink : control, in: Circle())
+                    }
+                    .accessibilityLabel(speech.isRecording ? "停止语音输入" : "开始语音输入")
+                    .contextMenu {
+                        Button("DeepSeek 设置", systemImage: "key") { settingsPresented = true }
+                    }
+
+                    Button {
+                        if inputIsEmpty && isKeyboardVisible {
+                            inputFocused = false
+                        } else {
+                            submit()
+                        }
+                    } label: {
+                        ZStack {
+                            Circle()
+                                .fill(!inputIsEmpty && !library.isLoading ? Color.accentColor : Color.primary.opacity(0.07))
+                            Image(systemName: library.isLoading ? "ellipsis" : (inputIsEmpty && isKeyboardVisible ? "keyboard.chevron.compact.down" : "arrow.up"))
+                                .font(.system(size: 16, weight: .medium))
+                                .foregroundStyle(!inputIsEmpty && !library.isLoading ? Color.white : secondary.opacity(inputIsEmpty && !isKeyboardVisible ? 0.55 : 1))
+                                .contentTransition(.opacity)
+                                .animation(.easeInOut(duration: 0.18), value: isKeyboardVisible)
+                        }
+                        .frame(width: 36, height: 36)
+                    }
+                    .buttonStyle(.plain)
+                    .contentShape(Circle())
+                    .disabled(library.isLoading || (inputIsEmpty && !isKeyboardVisible))
+                    .accessibilityLabel(inputIsEmpty && isKeyboardVisible ? "收起键盘" : "发送")
+                    .padding(.trailing, 6)
             }
-            .background(control, in: RoundedRectangle(cornerRadius: 27))
+            .frame(minHeight: 58)
+            .background(control, in: RoundedRectangle(cornerRadius: 30))
         }
         .padding(.horizontal, 14)
         .padding(.top, 10)
@@ -1004,7 +1076,8 @@ struct MainView: View {
     }
 
     private func expression(_ phrase: Phrase, index: Int, count: Int) -> some View {
-        VStack(alignment: .leading, spacing: 9) {
+        let isPhraseHighlighted = activePhraseMenuID == phrase.id
+        return VStack(alignment: .leading, spacing: 9) {
             WordFlowLayout(spacing: 5) {
                 ForEach(Array(phrase.english.split(whereSeparator: \.isWhitespace).enumerated()), id: \.offset) { _, token in
                     WordTokenButton(token: String(token), color: ink)
@@ -1021,19 +1094,40 @@ struct MainView: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel(library.speakingPhraseID == phrase.id ? "停止朗读" : "播放英式英语发音")
             }
-            .contextMenu {
-                Button(library.contains(phrase) ? "已收藏" : "收藏表达", systemImage: "bookmark") {
-                    if !library.contains(phrase) {
-                        library.toggleSaved(phrase)
-                        showToast("已收藏")
+            .background {
+                RoundedRectangle(cornerRadius: 11)
+                    .fill(Color.primary.opacity(isPhraseHighlighted ? 0.08 : 0))
+                    .padding(-6)
+            }
+            .animation(.spring(response: 0.28, dampingFraction: 0.82), value: isPhraseHighlighted)
+            .simultaneousGesture(
+                LongPressGesture(minimumDuration: 0.4)
+                    .onEnded { _ in
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                            activePhraseMenuID = phrase.id
+                        }
                     }
-                }
-                if library.contains(phrase) {
-                    Button("取消收藏", systemImage: "bookmark.slash", role: .destructive) {
-                        library.toggleSaved(phrase)
-                        showToast("已取消收藏")
+            )
+            .popover(isPresented: phraseMenuBinding(for: phrase.id), attachmentAnchor: .rect(.bounds), arrowEdge: .top) {
+                Button {
+                    let wasSaved = library.contains(phrase)
+                    library.toggleSaved(phrase)
+                    showToast(wasSaved ? "已取消收藏" : "已收藏")
+                    activePhraseMenuID = nil
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: library.contains(phrase) ? "bookmark.slash" : "bookmark")
+                            .font(.system(size: 15, weight: .medium))
+                        Text(library.contains(phrase) ? "取消收藏" : "收藏表达")
+                            .font(.system(size: 15, weight: .medium))
                     }
+                    .frame(maxWidth: .infinity, minHeight: 46, alignment: .center)
                 }
+                .buttonStyle(.plain)
+                .foregroundStyle(ink)
+                .frame(width: 200)
+                .padding(8)
+                .presentationCompactAdaptation(.popover)
             }
             Text(phrase.note)
                 .font(.system(size: 13))
@@ -1050,6 +1144,17 @@ struct MainView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func phraseMenuBinding(for id: UUID) -> Binding<Bool> {
+        Binding(
+            get: { activePhraseMenuID == id },
+            set: { isPresented in
+                if !isPresented && activePhraseMenuID == id {
+                    activePhraseMenuID = nil
+                }
+            }
+        )
     }
 
     private func showToast(_ text: String) {

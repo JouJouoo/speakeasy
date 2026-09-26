@@ -38,6 +38,66 @@ struct PracticeTurn: Identifiable, Codable {
     }
 }
 
+struct WordHistoryEntry: Identifiable, Codable {
+    let id: UUID
+    var word: String
+    var ipa: String
+    var meaning: String
+    var count: Int
+    var date: Date
+
+    private enum CodingKeys: String, CodingKey { case id, word, ipa, meaning, count, date }
+
+    init(id: UUID, word: String, ipa: String, meaning: String, count: Int = 1, date: Date) {
+        self.id = id
+        self.word = word
+        self.ipa = ipa
+        self.meaning = meaning
+        self.count = count
+        self.date = date
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        word = try values.decode(String.self, forKey: .word)
+        ipa = try values.decode(String.self, forKey: .ipa)
+        meaning = try values.decode(String.self, forKey: .meaning)
+        count = try values.decodeIfPresent(Int.self, forKey: .count) ?? 1
+        date = try values.decode(Date.self, forKey: .date)
+    }
+}
+
+struct GrammarHistoryEntry: Identifiable, Codable {
+    let id: UUID
+    var chinese: String
+    var english: String
+    var analysis: String
+    var count: Int
+    var date: Date
+
+    private enum CodingKeys: String, CodingKey { case id, chinese, english, analysis, count, date }
+
+    init(id: UUID, chinese: String, english: String, analysis: String, count: Int = 1, date: Date) {
+        self.id = id
+        self.chinese = chinese
+        self.english = english
+        self.analysis = analysis
+        self.count = count
+        self.date = date
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        chinese = try values.decode(String.self, forKey: .chinese)
+        english = try values.decode(String.self, forKey: .english)
+        analysis = try values.decode(String.self, forKey: .analysis)
+        count = try values.decodeIfPresent(Int.self, forKey: .count) ?? 1
+        date = try values.decode(Date.self, forKey: .date)
+    }
+}
+
 private enum PromptDefaults {
     static let role = "你是一位友善、耐心的英语口语教练，帮助中文学习者把想表达的意思说成自然、地道的日常英语。给出三种常用说法，并体现不同语气或场景。解释使用简体中文，例句简短自然。"
     static let request = "请把下面的中文改写成自然的英语口语表达。每种说法说明适用语气或场景，并给一个简短例句。"
@@ -57,6 +117,18 @@ final class PhraseLibrary: ObservableObject {
             UserDefaults.standard.set(data, forKey: "practiceHistory")
         }
     }
+    @Published fileprivate(set) var wordHistory: [WordHistoryEntry] = [] {
+        didSet {
+            guard let data = try? JSONEncoder().encode(wordHistory) else { return }
+            UserDefaults.standard.set(data, forKey: "wordLookupHistory")
+        }
+    }
+    @Published fileprivate(set) var grammarHistory: [GrammarHistoryEntry] = [] {
+        didSet {
+            guard let data = try? JSONEncoder().encode(grammarHistory) else { return }
+            UserDefaults.standard.set(data, forKey: "grammarAnalysisHistory")
+        }
+    }
     @Published var isLoading = false
     @Published private(set) var apiKeyConfigured: Bool
     @Published var systemPrompt: String {
@@ -70,9 +142,16 @@ final class PhraseLibrary: ObservableObject {
     @Published fileprivate var activeWordInfo: WordInfo?
     @Published fileprivate var isWordLookupLoading = false
     @Published fileprivate var wordLookupError: String?
+    @Published fileprivate var activeGrammarPhraseID: UUID?
+    @Published fileprivate var grammarAnalysis: String?
+    @Published fileprivate var isGrammarAnalysisLoading = false
+    @Published fileprivate var grammarAnalysisError: String?
     @Published private(set) var speakingPhraseID: UUID?
+    @Published fileprivate var speakingWordAnchor: UUID?
     private var wordCache: [String: WordInfo] = [:]
     private var activeWordTask: Task<Void, Never>?
+    private var grammarCache: [String: String] = [:]
+    private var grammarTask: Task<Void, Never>?
     private let speechSynthesizer = AVSpeechSynthesizer()
     private var speechMonitor: Task<Void, Never>?
 
@@ -89,6 +168,7 @@ final class PhraseLibrary: ObservableObject {
             turns = history.map { savedTurn in
                 var turn = savedTurn
                 turn.isLoading = false
+                turn.isExpanded = false
                 if turn.phrases.isEmpty && turn.message == nil {
                     turn.message = "这条练习上次没有完成，可以重新发送。"
                 }
@@ -98,6 +178,18 @@ final class PhraseLibrary: ObservableObject {
         if let data = UserDefaults.standard.data(forKey: "savedPhrases"),
            let phrases = try? JSONDecoder().decode([Phrase].self, from: data) {
             saved = phrases
+        }
+        if let data = UserDefaults.standard.data(forKey: "wordLookupHistory"),
+           let history = try? JSONDecoder().decode([WordHistoryEntry].self, from: data) {
+            wordHistory = deduplicatedWordHistory(history)
+        }
+        if let data = UserDefaults.standard.data(forKey: "grammarAnalysisHistory"),
+           let history = try? JSONDecoder().decode([GrammarHistoryEntry].self, from: data) {
+            grammarHistory = deduplicatedGrammarHistory(history)
+        }
+        for entry in grammarHistory {
+            let key = entry.english.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if grammarCache[key] == nil { grammarCache[key] = entry.analysis }
         }
     }
 
@@ -146,12 +238,29 @@ final class PhraseLibrary: ObservableObject {
         turns[index].isExpanded = false
     }
 
+    func collapseAllTurns() {
+        guard turns.contains(where: { $0.isExpanded }) else { return }
+        turns = turns.map { turn in
+            var collapsed = turn
+            collapsed.isExpanded = false
+            return collapsed
+        }
+    }
+
     func deleteTurn(_ id: UUID) {
         turns.removeAll { $0.id == id }
     }
 
     func deleteTurns(_ ids: Set<UUID>) {
         turns.removeAll { ids.contains($0.id) }
+    }
+
+    func deleteWordHistory(_ ids: Set<UUID>) {
+        wordHistory.removeAll { ids.contains($0.id) }
+    }
+
+    func deleteGrammarHistory(_ ids: Set<UUID>) {
+        grammarHistory.removeAll { ids.contains($0.id) }
     }
 
     fileprivate func lookupWord(_ word: String) async throws -> WordInfo {
@@ -179,6 +288,7 @@ final class PhraseLibrary: ObservableObject {
         if let cached = wordCache[cacheKey] {
             activeWordInfo = cached
             isWordLookupLoading = false
+            recordWordLookup(cached)
             return
         }
 
@@ -188,6 +298,7 @@ final class PhraseLibrary: ObservableObject {
                 let result = try await lookupWord(word)
                 guard !Task.isCancelled, activeWordAnchor == anchor else { return }
                 activeWordInfo = result
+                recordWordLookup(result)
             } catch {
                 guard !Task.isCancelled, activeWordAnchor == anchor else { return }
                 wordLookupError = error.localizedDescription
@@ -200,11 +311,125 @@ final class PhraseLibrary: ObservableObject {
         guard activeWordAnchor == anchor else { return }
         activeWordTask?.cancel()
         activeWordTask = nil
+        if speakingWordAnchor == anchor { stopCurrentSpeech() }
         activeWordAnchor = nil
         activeWord = ""
         activeWordInfo = nil
         wordLookupError = nil
         isWordLookupLoading = false
+    }
+
+    fileprivate func startGrammarAnalysis(for phrase: Phrase) {
+        grammarTask?.cancel()
+        activeGrammarPhraseID = phrase.id
+        grammarAnalysis = nil
+        grammarAnalysisError = nil
+
+        let cacheKey = phrase.english.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let cached = grammarCache[cacheKey] {
+            grammarAnalysis = cached
+            isGrammarAnalysisLoading = false
+            recordGrammarAnalysis(phrase, analysis: cached)
+            return
+        }
+
+        guard let apiKey = KeychainStore.load(), !apiKey.isEmpty else {
+            isGrammarAnalysisLoading = false
+            grammarAnalysisError = "请先连接 DeepSeek。"
+            return
+        }
+
+        isGrammarAnalysisLoading = true
+        grammarTask = Task { @MainActor in
+            do {
+                let result = try await DeepSeekClient.analyzeGrammar(phrase.english, apiKey: apiKey)
+                guard !Task.isCancelled, activeGrammarPhraseID == phrase.id else { return }
+                grammarCache[cacheKey] = result
+                grammarAnalysis = result
+                recordGrammarAnalysis(phrase, analysis: result)
+            } catch {
+                guard !Task.isCancelled, activeGrammarPhraseID == phrase.id else { return }
+                grammarAnalysisError = error.localizedDescription
+            }
+            isGrammarAnalysisLoading = false
+        }
+    }
+
+    fileprivate func dismissGrammarAnalysis(phraseID: UUID) {
+        guard activeGrammarPhraseID == phraseID else { return }
+        grammarTask?.cancel()
+        grammarTask = nil
+        activeGrammarPhraseID = nil
+        grammarAnalysis = nil
+        grammarAnalysisError = nil
+        isGrammarAnalysisLoading = false
+    }
+
+    private func recordWordLookup(_ wordInfo: WordInfo) {
+        if let index = wordHistory.firstIndex(where: { $0.word.caseInsensitiveCompare(wordInfo.word) == .orderedSame }) {
+            var entry = wordHistory.remove(at: index)
+            entry.count += 1
+            entry.ipa = wordInfo.ipa
+            entry.meaning = wordInfo.meaning
+            entry.date = Date()
+            wordHistory.insert(entry, at: 0)
+        } else {
+            wordHistory.insert(
+                WordHistoryEntry(id: UUID(), word: wordInfo.word, ipa: wordInfo.ipa, meaning: wordInfo.meaning, date: Date()),
+                at: 0
+            )
+        }
+    }
+
+    private func deduplicatedWordHistory(_ entries: [WordHistoryEntry]) -> [WordHistoryEntry] {
+        let newestFirst = entries.sorted { $0.date > $1.date }
+        var order: [String] = []
+        var grouped: [String: WordHistoryEntry] = [:]
+        for entry in newestFirst {
+            let key = entry.word.lowercased()
+            if var existing = grouped[key] {
+                existing.count += entry.count
+                grouped[key] = existing
+            } else {
+                order.append(key)
+                grouped[key] = entry
+            }
+        }
+        return order.compactMap { grouped[$0] }
+    }
+
+    private func deduplicatedGrammarHistory(_ entries: [GrammarHistoryEntry]) -> [GrammarHistoryEntry] {
+        let newestFirst = entries.sorted { $0.date > $1.date }
+        var order: [String] = []
+        var grouped: [String: GrammarHistoryEntry] = [:]
+        for entry in newestFirst {
+            let key = entry.english.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if var existing = grouped[key] {
+                existing.count += entry.count
+                grouped[key] = existing
+            } else {
+                order.append(key)
+                grouped[key] = entry
+            }
+        }
+        return order.compactMap { grouped[$0] }
+    }
+
+    private func recordGrammarAnalysis(_ phrase: Phrase, analysis: String) {
+        let key = phrase.english.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let index = grammarHistory.firstIndex(where: { $0.english.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == key }) {
+            var entry = grammarHistory.remove(at: index)
+            entry.count += 1
+            entry.chinese = phrase.chinese
+            entry.analysis = analysis
+            entry.date = Date()
+            grammarHistory.insert(entry, at: 0)
+        } else {
+            grammarHistory.insert(
+                GrammarHistoryEntry(id: UUID(), chinese: phrase.chinese, english: phrase.english, analysis: analysis, date: Date()),
+                at: 0
+            )
+        }
     }
 
     func saveAPIKey(_ key: String) throws {
@@ -225,30 +450,45 @@ final class PhraseLibrary: ObservableObject {
         }
     }
 
+    func deleteSavedPhrases(_ ids: Set<UUID>) {
+        saved.removeAll { ids.contains($0.id) }
+    }
+
     func contains(_ phrase: Phrase) -> Bool {
         saved.contains { $0.english == phrase.english }
     }
 
     func speak(_ phrase: Phrase) {
         if speakingPhraseID == phrase.id, speechSynthesizer.isSpeaking {
-            speechMonitor?.cancel()
-            speechSynthesizer.stopSpeaking(at: .immediate)
-            speakingPhraseID = nil
+            stopCurrentSpeech()
             return
         }
+        speakText(phrase.english, phraseID: phrase.id)
+    }
 
+    func speakWord(_ word: String, anchor: UUID) {
+        guard !word.isEmpty else { return }
+        if speakingWordAnchor == anchor, speechSynthesizer.isSpeaking {
+            stopCurrentSpeech()
+            return
+        }
+        speakText(word, wordAnchor: anchor)
+    }
+
+    private func speakText(_ text: String, phraseID: UUID? = nil, wordAnchor: UUID? = nil) {
         speechMonitor?.cancel()
         speechSynthesizer.stopSpeaking(at: .immediate)
         // Speech input configures the app's shared audio session for recording.
         // Let iOS manage a separate playback session so TTS remains audible and
         // the hardware volume buttons control media volume normally.
         speechSynthesizer.usesApplicationAudioSession = false
-        let utterance = AVSpeechUtterance(string: phrase.english)
+        let utterance = AVSpeechUtterance(string: text)
         utterance.voice = AVSpeechSynthesisVoice(language: "en-GB")
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate * 0.92
         utterance.volume = 1.0
         speechSynthesizer.speak(utterance)
-        speakingPhraseID = phrase.id
+        speakingPhraseID = phraseID
+        speakingWordAnchor = wordAnchor
 
         speechMonitor = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -257,10 +497,18 @@ final class PhraseLibrary: ObservableObject {
                 guard !Task.isCancelled else { return }
                 if !self.speechSynthesizer.isSpeaking {
                     self.speakingPhraseID = nil
+                    self.speakingWordAnchor = nil
                     return
                 }
             }
         }
+    }
+
+    private func stopCurrentSpeech() {
+        speechMonitor?.cancel()
+        speechSynthesizer.stopSpeaking(at: .immediate)
+        speakingPhraseID = nil
+        speakingWordAnchor = nil
     }
 }
 
@@ -359,6 +607,10 @@ private enum DeepSeekClient {
     private struct WordResponse: Decodable {
         let ipa: String
         let meaning: String
+    }
+
+    private struct GrammarResponse: Decodable {
+        let analysis: String
     }
 
     private struct LookupHTTPResult: @unchecked Sendable {
@@ -460,6 +712,42 @@ private enum DeepSeekClient {
         }
         return WordInfo(word: word, ipa: result.ipa, meaning: result.meaning)
     }
+
+    static func analyzeGrammar(_ sentence: String, apiKey: String) async throws -> String {
+        var request = URLRequest(url: URL(string: "https://api.deepseek.com/chat/completions")!)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 20
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONEncoder().encode(ChatRequest(messages: [
+            .init(role: "system", content: "You are an English grammar tutor for Chinese learners. Return only valid json with exactly one key named analysis. The value must be concise Simplified Chinese, explaining the sentence's core structure, tense, and important clauses or phrases. Do not rewrite the sentence or add examples. Include the word json in your response format instructions."),
+            .init(role: "user", content: "请分析这句英语的语法结构，用简洁的简体中文说明主干、时态以及关键从句或短语。只分析这整句话，不要例句。请用 json 格式返回。\n句子：\(sentence)")
+        ], max_tokens: 220))
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch {
+            throw DeepSeekError.service("语法分析连接失败，请检查网络后重试。")
+        }
+        guard let http = response as? HTTPURLResponse else { throw DeepSeekError.badResponse }
+        guard (200..<300).contains(http.statusCode) else {
+            let detail = try? JSONDecoder().decode(APIErrorResponse.self, from: data).error?.message
+            if http.statusCode == 401 { throw DeepSeekError.service("DeepSeek 密钥无效，请到设置中检查。") }
+            if http.statusCode == 402 { throw DeepSeekError.service("DeepSeek 账户余额不足，请检查账户余额。") }
+            if http.statusCode == 429 { throw DeepSeekError.service("请求太频繁了，请稍等片刻再试。") }
+            throw DeepSeekError.service(detail ?? "语法分析暂时失败，请稍后重试。")
+        }
+        let chat = try JSONDecoder().decode(ChatResponse.self, from: data)
+        guard let content = chat.choices.first?.message.content,
+              let json = content.data(using: .utf8),
+              let result = try? JSONDecoder().decode(GrammarResponse.self, from: json),
+              !result.analysis.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw DeepSeekError.service("暂时无法解析语法分析结果，请重试。")
+        }
+        return result.analysis
+    }
 }
 
 struct WordInfo: Codable {
@@ -514,10 +802,15 @@ private struct WordTokenButton: View {
     @EnvironmentObject private var library: PhraseLibrary
     let token: String
     let color: Color
+    let interactionDisabled: Bool
     @State private var anchorID = UUID()
 
     private var lookupWord: String {
         token.trimmingCharacters(in: .punctuationCharacters)
+    }
+
+    private var isActiveLookup: Bool {
+        library.activeWordAnchor == anchorID
     }
 
     private var popoverBinding: Binding<Bool> {
@@ -529,33 +822,75 @@ private struct WordTokenButton: View {
         )
     }
 
+    private var popoverWidth: CGFloat {
+        let wordWidth = (library.activeWord as NSString).size(
+            withAttributes: [.font: UIFont.systemFont(ofSize: 18, weight: .semibold)]
+        ).width
+        let ipaWidth = ((library.activeWordInfo?.ipa ?? "") as NSString).size(
+            withAttributes: [.font: UIFont.systemFont(ofSize: 15)]
+        ).width
+        let meaningWidth = ((library.activeWordInfo?.meaning ?? library.wordLookupError ?? "") as NSString).size(
+            withAttributes: [.font: UIFont.systemFont(ofSize: 15)]
+        ).width
+        return min(360, max(236, ceil(max(wordWidth + 208, ipaWidth + 40, meaningWidth + 40))))
+    }
+
     var body: some View {
         Button {
-            guard !lookupWord.isEmpty else { return }
+            guard !lookupWord.isEmpty, !interactionDisabled else { return }
             library.startWordLookup(lookupWord, anchor: anchorID)
         } label: {
             Text(token)
                 .font(.system(size: 24, weight: .medium, design: .serif))
-                .foregroundStyle(color)
+                .foregroundStyle(isActiveLookup ? Color.accentColor : color)
+                .padding(.horizontal, 3)
+                .padding(.vertical, 2)
+                .background {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.accentColor.opacity(isActiveLookup ? 0.14 : 0))
+                }
+                .overlay {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .stroke(Color.accentColor.opacity(isActiveLookup ? 0.25 : 0), lineWidth: 1)
+                }
+                .scaleEffect(isActiveLookup ? 1.06 : 1)
+                .animation(.easeOut(duration: isActiveLookup ? 0.16 : 0.08), value: isActiveLookup)
                 .fixedSize()
         }
         .buttonStyle(.plain)
         .disabled(lookupWord.isEmpty)
         .popover(isPresented: popoverBinding, attachmentAnchor: .rect(.bounds), arrowEdge: .top) {
             VStack(alignment: .center, spacing: 12) {
-                ZStack(alignment: .trailing) {
+                HStack(spacing: 0) {
+                    Color.clear
+                        .frame(width: 82, height: 32)
                     Text(library.activeWord)
                         .font(.system(size: 18, weight: .semibold, design: .serif))
                         .lineLimit(1)
-                        .minimumScaleFactor(0.8)
-                        .frame(maxWidth: .infinity, minHeight: 28)
-                        .padding(.horizontal, 30)
-                    Button { library.dismissWordLookup(anchor: anchorID) } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.tertiary)
+                        .minimumScaleFactor(0.7)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity)
+                    HStack(spacing: 18) {
+                        Button {
+                            library.speakWord(library.activeWord, anchor: anchorID)
+                        } label: {
+                            Image(systemName: library.speakingWordAnchor == anchorID ? "stop.fill" : "speaker.wave.2.fill")
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundStyle(library.speakingWordAnchor == anchorID ? Color.accentColor : .secondary)
+                                .frame(width: 32, height: 32)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(library.speakingWordAnchor == anchorID ? "停止单词发音" : "朗读单词")
+                        Button { library.dismissWordLookup(anchor: anchorID) } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.tertiary)
+                                .frame(width: 32, height: 32)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("关闭")
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("关闭")
                 }
                 if library.isWordLookupLoading {
                     VStack(spacing: 8) {
@@ -575,12 +910,14 @@ private struct WordTokenButton: View {
                     Text(info.meaning)
                         .font(.system(size: 15))
                         .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity)
                 } else if let error = library.wordLookupError {
                     Text(error)
                         .font(.system(size: 14))
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity)
                     Button("重试") {
                         library.startWordLookup(lookupWord, anchor: anchorID)
@@ -589,104 +926,192 @@ private struct WordTokenButton: View {
                 }
             }
             .padding(16)
-            .frame(width: 270, alignment: .center)
+            .frame(width: popoverWidth, alignment: .center)
             .presentationCompactAdaptation(.popover)
         }
     }
 }
 
 struct SettingsView: View {
+    var body: some View {
+        SettingsContentView()
+            .navigationTitle("设置")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar(.visible, for: .navigationBar)
+    }
+}
+
+private struct SettingsContentView: View {
     @EnvironmentObject private var library: PhraseLibrary
     @AppStorage("appearanceMode") private var appearanceMode = "system"
+    @State private var expandedPrompt: String?
 
-    private let ink = Color.primary
+    private var appearanceName: String {
+        switch appearanceMode {
+        case "light": "浅色"
+        case "dark": "深色"
+        default: "跟随系统"
+        }
+    }
+
+    @ViewBuilder
+    private func glassCard<S: Shape>(_ shape: S) -> some View {
+        if #available(iOS 26.0, *) {
+            Color.clear.glassEffect(.regular, in: shape)
+        } else {
+            shape.fill(Color(uiColor: .secondarySystemGroupedBackground))
+        }
+    }
+
+    private func promptCard(_ title: String, symbol: String, text: Binding<String>, id: String) -> some View {
+        let isExpanded = expandedPrompt == id
+        return VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    expandedPrompt = isExpanded ? nil : id
+                }
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: symbol)
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .frame(width: 36, height: 36)
+                        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 11))
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(title)
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(.primary)
+                        if !isExpanded {
+                            Text(text.wrappedValue)
+                                .font(.system(size: 13))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                    Spacer(minLength: 8)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                        .rotationEffect(.degrees(isExpanded ? 180 : 0))
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                TextEditor(text: text)
+                    .font(.system(size: 14))
+                    .scrollContentBackground(.hidden)
+                    .frame(height: id == "role" ? 132 : 112)
+                    .padding(8)
+                    .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 14))
+                    .padding(.top, 14)
+                    .transition(.opacity)
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background { glassCard(RoundedRectangle(cornerRadius: 22)) }
+    }
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 28) {
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("外观")
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundStyle(ink)
-                    Picker("外观", selection: $appearanceMode) {
+                    Text("显示")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.leading, 12)
+
+                    VStack(alignment: .leading, spacing: 18) {
+                        HStack(spacing: 12) {
+                            Image(systemName: "circle.lefthalf.filled")
+                                .font(.system(size: 17, weight: .medium))
+                                .frame(width: 36, height: 36)
+                                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 11))
+                            Text("外观")
+                                .font(.system(size: 16, weight: .semibold))
+                            Spacer()
+                            Text(appearanceName)
+                                .font(.system(size: 13))
+                                .foregroundStyle(.secondary)
+                        }
+                        Picker("外观", selection: $appearanceMode) {
                         Text("跟随系统").tag("system")
                         Text("浅色").tag("light")
                         Text("深色").tag("dark")
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
                     }
-                    .pickerStyle(.segmented)
+                    .padding(16)
+                    .background { glassCard(RoundedRectangle(cornerRadius: 22)) }
                 }
-                .padding(16)
-                .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 18))
 
-                HStack(alignment: .firstTextBaseline) {
-                    Text("回复偏好")
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundStyle(ink)
-                    Spacer()
-                    Button("恢复默认") {
-                        library.systemPrompt = PromptDefaults.role
-                        library.requestPrompt = PromptDefaults.request
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Text("AI 回复")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .padding(.leading, 12)
+                        Spacer()
+                        Button {
+                            library.systemPrompt = PromptDefaults.role
+                            library.requestPrompt = PromptDefaults.request
+                        } label: {
+                            Label("恢复默认", systemImage: "arrow.counterclockwise")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 12)
+                                .frame(height: 30)
+                                .background { glassCard(Capsule()) }
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.secondary)
-                }
 
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("角色设定")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(.secondary)
-                    TextEditor(text: $library.systemPrompt)
-                        .font(.system(size: 14))
-                        .scrollContentBackground(.hidden)
-                        .frame(minHeight: 112)
-                        .padding(10)
-                        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
-                }
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("生成要求")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(.secondary)
-                    TextEditor(text: $library.requestPrompt)
-                        .font(.system(size: 14))
-                        .scrollContentBackground(.hidden)
-                        .frame(minHeight: 92)
-                        .padding(10)
-                        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+                    promptCard("角色设定", symbol: "person.text.rectangle", text: $library.systemPrompt, id: "role")
+                    promptCard("生成要求", symbol: "text.alignleft", text: $library.requestPrompt, id: "request")
                 }
             }
-            .padding(16)
-            .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18))
-            .padding(.horizontal, 18)
-            .padding(.top, 18)
-            .padding(.bottom, 28)
+            .padding(.horizontal, 20)
+            .padding(.top, 24)
+            .padding(.bottom, 36)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
-        .navigationTitle("设置")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar(.visible, for: .navigationBar)
     }
 }
 
 struct MainView: View {
     @EnvironmentObject private var library: PhraseLibrary
+    @Environment(\.scenePhase) private var scenePhase
     @AppStorage("appearanceMode") private var appearanceMode = "system"
     @State private var input = ""
     @State private var settingsPresented = false
     @State private var savedPresented = false
+    @State private var edgeSettingsPresented = false
+    @State private var wordHistoryPresented = false
+    @State private var grammarHistoryPresented = false
     @StateObject private var speech = SpeechInputController()
     @State private var toast: String?
+    @State private var didInitialHistoryScroll = false
     @State private var ignoreLateSpeechTranscript = false
-    @State private var isKeyboardVisible = false
-    @State private var activePhraseMenuID: UUID?
+    @State private var openPhraseSwipeID: UUID?
+    @State private var phraseSwipeOffset: CGFloat = 0
+    @State private var phraseSwipeStartOffset: CGFloat = 0
+    @State private var phraseSwipeDragID: UUID?
+    @State private var suppressPhraseActions = false
+    @State private var phraseActionSuppressionToken: UUID?
     @State private var isSelectingTurns = false
     @State private var selectedTurnIDs: Set<UUID> = []
+    @State private var pendingExpandedTurnID: UUID?
     @State private var openSwipeTurnID: UUID?
     @State private var swipeDragTurnID: UUID?
     @State private var swipeOffset: CGFloat = 0
     @State private var swipeStartOffset: CGFloat = 0
     private let swipeRevealWidth: CGFloat = 96
+    private let phraseSaveRevealWidth: CGFloat = 88
     @FocusState private var inputFocused: Bool
 
     private let ink = Color.primary
@@ -711,24 +1136,72 @@ struct MainView: View {
         return "\(library.turns.count)-\(latest.id.uuidString)-\(latest.isLoading)-\(latest.phrases.count)-\(latest.message ?? "")"
     }
 
+    @ViewBuilder
+    private func glassSurface<S: Shape>(_ shape: S, tint: Color? = nil, interactive: Bool = false) -> some View {
+        if #available(iOS 26.0, *) {
+            let baseGlass = tint.map { Glass.regular.tint($0) } ?? Glass.regular
+            Color.clear.glassEffect(interactive ? baseGlass.interactive() : baseGlass, in: shape)
+        } else {
+            shape.fill(.ultraThinMaterial)
+                .overlay {
+                    if let tint {
+                        shape.fill(tint.opacity(0.14))
+                    }
+                }
+        }
+    }
+
+    private func headerButtonIcon(_ systemName: String) -> some View {
+        Image(systemName: systemName)
+            .font(.system(size: 15, weight: .medium))
+            .foregroundStyle(secondary.opacity(0.82))
+            .frame(width: 38, height: 38)
+            .background { glassSurface(Circle(), interactive: true) }
+            .contentShape(Circle())
+    }
+
+    private func selectionButtonLabel(_ title: String, symbol: String, color: Color = .primary, glassTint: Color? = nil) -> some View {
+        Label(title, systemImage: symbol)
+            .font(.system(size: 13, weight: .medium))
+            .foregroundStyle(color)
+            .padding(.horizontal, 13)
+            .frame(height: 38)
+            .background { glassSurface(Capsule(), tint: glassTint, interactive: true) }
+            .contentShape(Capsule())
+    }
+
+    private func showEdgeSettings() {
+        withAnimation(.easeInOut(duration: 0.28)) {
+            edgeSettingsPresented = true
+        }
+    }
+
+    private func closeEdgeSettings() {
+        withAnimation(.easeInOut(duration: 0.28)) {
+            edgeSettingsPresented = false
+        }
+    }
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
                 HStack {
                     Spacer()
                     if isSelectingTurns {
-                        Button("取消") {
+                        Button {
                             isSelectingTurns = false
                             selectedTurnIDs.removeAll()
+                        } label: {
+                            selectionButtonLabel("取消", symbol: "xmark", color: secondary)
                         }
-                        .font(.system(size: 14, weight: .regular))
-                        .foregroundStyle(secondary)
+                        .buttonStyle(.plain)
 
-                        Button("全选") {
+                        Button {
                             selectedTurnIDs = Set(library.turns.map(\.id))
+                        } label: {
+                            selectionButtonLabel("全选", symbol: "checkmark.circle")
                         }
-                        .font(.system(size: 14, weight: .regular))
-                        .foregroundStyle(ink)
+                        .buttonStyle(.plain)
                         .disabled(library.turns.isEmpty)
 
                         Button {
@@ -738,11 +1211,14 @@ struct MainView: View {
                                 isSelectingTurns = false
                             }
                         } label: {
-                            Text("删除（\(selectedTurnIDs.count)）")
-                                .font(.system(size: 14, weight: .medium))
-                                .foregroundStyle(selectedTurnIDs.isEmpty ? secondary.opacity(0.35) : .red)
-                                .frame(minHeight: 36)
+                            selectionButtonLabel(
+                                "删除 \(selectedTurnIDs.count)",
+                                symbol: "trash",
+                                color: selectedTurnIDs.isEmpty ? secondary : .red,
+                                glassTint: selectedTurnIDs.isEmpty ? nil : .red.opacity(0.12)
+                            )
                         }
+                        .buttonStyle(.plain)
                         .disabled(selectedTurnIDs.isEmpty)
                         .accessibilityLabel("删除所选记录")
                     } else {
@@ -752,40 +1228,45 @@ struct MainView: View {
                             openSwipeTurnID = nil
                             swipeOffset = 0
                         } label: {
-                            Image(systemName: "checklist")
-                                .font(.system(size: 15, weight: .regular))
-                                .foregroundStyle(secondary.opacity(0.75))
-                                .frame(width: 36, height: 36)
+                            headerButtonIcon("checklist")
                         }
                         .accessibilityLabel("多选记录")
 
-                        Button { savedPresented = true } label: {
-                            Image(systemName: "bookmark")
-                                .font(.system(size: 15, weight: .regular))
-                                .foregroundStyle(secondary.opacity(0.75))
-                                .frame(width: 36, height: 36)
+                        Button { wordHistoryPresented = true } label: {
+                            headerButtonIcon("text.magnifyingglass")
                         }
-                        .accessibilityLabel("收藏夹")
+                        .accessibilityLabel("单词查询记录")
 
-                        Button { settingsPresented = true } label: {
-                            Image(systemName: "gearshape")
-                                .font(.system(size: 15, weight: .regular))
-                                .foregroundStyle(secondary.opacity(0.75))
-                                .frame(width: 36, height: 36)
+                        Button { grammarHistoryPresented = true } label: {
+                            headerButtonIcon("text.alignleft")
                         }
-                        .accessibilityLabel("设置")
+                        .accessibilityLabel("语法分析记录")
+
                     }
                 }
                 .padding(.horizontal, 26)
                 .padding(.top, 10)
                 .padding(.bottom, 10)
                 .background(canvas)
+                .contentShape(Rectangle())
+                .simultaneousGesture(TapGesture().onEnded { inputFocused = false })
 
                 ScrollViewReader { scrollProxy in
                     ScrollView {
                         VStack(alignment: .leading, spacing: 28) {
                             ForEach(Array(library.turns.enumerated()), id: \.element.id) { turnIndex, turn in
-                                historyRow(turn, index: turnIndex, total: library.turns.count)
+                                historyRow(turn, index: turnIndex, total: library.turns.count) { turnID, targetID in
+                                    pendingExpandedTurnID = turnID
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
+                                        guard pendingExpandedTurnID == turnID,
+                                              library.turns.first(where: { $0.id == turnID })?.isExpanded == true else { return }
+                                        pendingExpandedTurnID = nil
+                                        withAnimation(.easeInOut(duration: 0.22)) {
+                                            scrollProxy.scrollTo(targetID, anchor: .bottom)
+                                        }
+                                    }
+                                }
+                                .id(turn.id)
                             }
                         }
                         .frame(maxWidth: .infinity, minHeight: 1, alignment: .topLeading)
@@ -798,7 +1279,9 @@ struct MainView: View {
                             .id("history-bottom")
                     }
                     .scrollIndicators(.hidden)
-                    .scrollDismissesKeyboard(.interactively)
+                    .scrollDismissesKeyboard(.immediately)
+                    .contentShape(Rectangle())
+                    .simultaneousGesture(TapGesture().onEnded { inputFocused = false })
                     .onChange(of: latestTurnScrollKey) { _, _ in
                         DispatchQueue.main.async {
                             withAnimation(.easeOut(duration: 0.25)) {
@@ -806,15 +1289,110 @@ struct MainView: View {
                             }
                         }
                     }
+                    .onAppear {
+                        guard !didInitialHistoryScroll else { return }
+                        didInitialHistoryScroll = true
+                        DispatchQueue.main.async {
+                            scrollProxy.scrollTo("history-bottom", anchor: .bottom)
+                        }
+                    }
+                    .onChange(of: scenePhase) { _, phase in
+                        guard phase == .active else { return }
+                        library.collapseAllTurns()
+                        DispatchQueue.main.async {
+                            scrollProxy.scrollTo("history-bottom", anchor: .bottom)
+                        }
+                    }
                 }
+
+                inputBar
             }
             .background(canvas.ignoresSafeArea())
-            .safeAreaInset(edge: .bottom, spacing: 0) { inputBar }
+            .overlay {
+                GeometryReader { geometry in
+                    ZStack {
+                        HStack(spacing: 0) {
+                            Color.clear
+                                .frame(width: 24)
+                                .contentShape(Rectangle())
+                                .simultaneousGesture(
+                                    DragGesture(minimumDistance: 18, coordinateSpace: .global)
+                                        .onEnded { value in
+                                            guard value.translation.width > 64,
+                                                  value.translation.width > abs(value.translation.height) * 1.3 else { return }
+                                            showEdgeSettings()
+                                        }
+                                )
+
+                            Spacer(minLength: 0)
+
+                            Color.clear
+                                .frame(width: 24)
+                                .contentShape(Rectangle())
+                                .simultaneousGesture(
+                                    DragGesture(minimumDistance: 18, coordinateSpace: .global)
+                                        .onEnded { value in
+                                            guard value.translation.width < -64,
+                                                  abs(value.translation.width) > abs(value.translation.height) * 1.3 else { return }
+                                            savedPresented = true
+                                        }
+                                )
+                        }
+
+                        if edgeSettingsPresented {
+                            VStack(spacing: 0) {
+                                HStack {
+                                    Button(action: closeEdgeSettings) {
+                                        Image(systemName: "chevron.left")
+                                            .font(.system(size: 16, weight: .semibold))
+                                            .foregroundStyle(ink)
+                                            .frame(width: 38, height: 38)
+                                            .background { glassSurface(Circle(), interactive: true) }
+                                            .contentShape(Circle())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .accessibilityLabel("返回")
+                                    Spacer()
+                                    Text("设置")
+                                        .font(.system(size: 17, weight: .semibold))
+                                    Spacer()
+                                    Color.clear.frame(width: 38, height: 38)
+                                }
+                                .padding(.horizontal, 16)
+                                .frame(height: 56)
+                                .background(canvas)
+
+                                SettingsContentView().environmentObject(library)
+                            }
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .background(canvas.ignoresSafeArea())
+                            .transition(.asymmetric(insertion: .move(edge: .leading), removal: .move(edge: .leading)))
+                            .simultaneousGesture(
+                                DragGesture(minimumDistance: 20)
+                                    .onEnded { value in
+                                        guard value.startLocation.x >= geometry.size.width - 28,
+                                              value.translation.width < -70,
+                                              abs(value.translation.width) > abs(value.translation.height) * 1.3 else { return }
+                                        closeEdgeSettings()
+                                    }
+                            )
+                            .zIndex(1)
+                        }
+                    }
+                    .frame(width: geometry.size.width, height: geometry.size.height)
+                }
+            }
             .navigationDestination(isPresented: $settingsPresented) {
                 SettingsView().environmentObject(library)
             }
             .navigationDestination(isPresented: $savedPresented) {
                 SavedPhrasesView().environmentObject(library)
+            }
+            .navigationDestination(isPresented: $wordHistoryPresented) {
+                WordHistoryView().environmentObject(library)
+            }
+            .navigationDestination(isPresented: $grammarHistoryPresented) {
+                GrammarHistoryView().environmentObject(library)
             }
             .toolbar(.hidden, for: .navigationBar)
         }
@@ -825,15 +1403,9 @@ struct MainView: View {
                 input = transcript
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
-            isKeyboardVisible = true
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
-            isKeyboardVisible = false
-        }
     }
 
-    private func historyRow(_ turn: PracticeTurn, index: Int, total: Int) -> some View {
+    private func historyRow(_ turn: PracticeTurn, index: Int, total: Int, onExpand: @escaping (UUID, UUID) -> Void) -> some View {
         VStack(alignment: .leading, spacing: 18) {
             ZStack(alignment: .leading) {
                 if isSelectingTurns {
@@ -861,24 +1433,30 @@ struct MainView: View {
                     .frame(minHeight: 44)
                     .background(canvas)
                 } else {
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            library.toggleExpanded(turn.id)
-                        }
-                    } label: {
-                        HStack(alignment: .firstTextBaseline, spacing: 10) {
-                            Text(turn.chinese)
-                                .font(.system(size: 16, weight: .medium))
-                                .foregroundStyle(ink)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                    HStack(alignment: .center, spacing: 10) {
+                        Text(turn.chinese)
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundStyle(ink)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Button {
+                            let willExpand = !turn.isExpanded
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                library.toggleExpanded(turn.id)
+                            }
+                            if willExpand {
+                                onExpand(turn.id, turn.phrases.last?.id ?? turn.id)
+                            }
+                        } label: {
                             Image(systemName: turn.isExpanded ? "chevron.up" : "chevron.down")
                                 .font(.system(size: 11, weight: .medium))
                                 .foregroundStyle(secondary.opacity(0.75))
+                                .frame(width: 44, height: 44)
+                                .contentShape(Rectangle())
                         }
-                        .contentShape(Rectangle())
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(turn.isExpanded ? "折叠这条记录" : "展开这条记录")
                     }
-                    .buttonStyle(.plain)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .frame(minHeight: 44)
                     .background(canvas)
@@ -963,6 +1541,7 @@ struct MainView: View {
                     VStack(alignment: .leading, spacing: 24) {
                         ForEach(Array(turn.phrases.enumerated()), id: \.element.id) { phraseIndex, phrase in
                             expression(phrase, index: phraseIndex + 1, count: turn.phrases.count)
+                                .id(phrase.id)
                         }
                     }
                 } else if let message = turn.message {
@@ -1002,7 +1581,10 @@ struct MainView: View {
                     .multilineTextAlignment(.leading)
                     .submitLabel(.send)
                     .focused($inputFocused)
-                    .onSubmit(submit)
+                    .onSubmit {
+                        if inputIsEmpty { inputFocused = false }
+                        else { submit() }
+                    }
                     .onChange(of: input) { _, newValue in
                         guard newValue.contains("\n") else { return }
                         input = newValue.replacingOccurrences(of: "\n", with: " ")
@@ -1021,42 +1603,34 @@ struct MainView: View {
                         }
                     } label: {
                         Image(systemName: speech.isRecording ? "waveform" : "mic")
-                            .font(.system(size: 18, weight: .medium))
+                            .font(.system(size: 17, weight: .medium))
                             .foregroundStyle(speech.isRecording ? Color(uiColor: .systemBackground) : secondary)
-                            .frame(width: 44, height: 44)
-                            .background(speech.isRecording ? ink : control, in: Circle())
+                            .frame(width: 40, height: 40)
+                            .background { glassSurface(Circle(), tint: speech.isRecording ? ink : nil, interactive: true) }
                     }
                     .accessibilityLabel(speech.isRecording ? "停止语音输入" : "开始语音输入")
                     .contextMenu {
                         Button("DeepSeek 设置", systemImage: "key") { settingsPresented = true }
                     }
 
-                    Button {
-                        if inputIsEmpty && isKeyboardVisible {
-                            inputFocused = false
-                        } else {
-                            submit()
-                        }
-                    } label: {
-                        ZStack {
-                            Circle()
-                                .fill(!inputIsEmpty && !library.isLoading ? Color.accentColor : Color.primary.opacity(0.07))
-                            Image(systemName: library.isLoading ? "ellipsis" : (inputIsEmpty && isKeyboardVisible ? "keyboard.chevron.compact.down" : "arrow.up"))
-                                .font(.system(size: 16, weight: .medium))
-                                .foregroundStyle(!inputIsEmpty && !library.isLoading ? Color.white : secondary.opacity(inputIsEmpty && !isKeyboardVisible ? 0.55 : 1))
-                                .contentTransition(.opacity)
-                                .animation(.easeInOut(duration: 0.18), value: isKeyboardVisible)
-                        }
-                        .frame(width: 36, height: 36)
+                    Button(action: submit) {
+                        Image(systemName: "arrow.up")
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundStyle(!inputIsEmpty && !library.isLoading ? Color.white : secondary.opacity(0.55))
+                            .frame(width: 40, height: 40)
+                            .background {
+                                glassSurface(
+                                    Circle(),
+                                    tint: !inputIsEmpty && !library.isLoading ? Color.accentColor : nil,
+                                    interactive: true
+                                )
+                            }
                     }
-                    .buttonStyle(.plain)
-                    .contentShape(Circle())
-                    .disabled(library.isLoading || (inputIsEmpty && !isKeyboardVisible))
-                    .accessibilityLabel(inputIsEmpty && isKeyboardVisible ? "收起键盘" : "发送")
+                    .accessibilityLabel("发送")
                     .padding(.trailing, 6)
             }
             .frame(minHeight: 58)
-            .background(control, in: RoundedRectangle(cornerRadius: 30))
+            .background { glassSurface(RoundedRectangle(cornerRadius: 28)) }
         }
         .padding(.horizontal, 14)
         .padding(.top, 10)
@@ -1079,59 +1653,111 @@ struct MainView: View {
     }
 
     private func expression(_ phrase: Phrase, index: Int, count: Int) -> some View {
-        let isPhraseHighlighted = activePhraseMenuID == phrase.id
+        let isPhraseSwipeOpen = openPhraseSwipeID == phrase.id
+        let isSaved = library.contains(phrase)
         return VStack(alignment: .leading, spacing: 9) {
-            WordFlowLayout(spacing: 5) {
-                ForEach(Array(phrase.english.split(whereSeparator: \.isWhitespace).enumerated()), id: \.offset) { _, token in
-                    WordTokenButton(token: String(token), color: ink)
-                }
+            ZStack(alignment: .trailing) {
                 Button {
-                    library.speak(phrase)
+                    library.toggleSaved(phrase)
+                    showToast(isSaved ? "已取消收藏" : "已收藏")
+                    closePhraseSwipe(phrase.id)
                 } label: {
-                    Image(systemName: library.speakingPhraseID == phrase.id ? "stop.fill" : "speaker.wave.2.fill")
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(secondary)
-                        .frame(width: 28, height: 30)
-                        .contentShape(Rectangle())
+                    VStack(spacing: 4) {
+                        Image(systemName: isSaved ? "bookmark.fill" : "bookmark")
+                            .font(.system(size: 15, weight: .semibold))
+                        Text(isSaved ? "已收藏" : "收藏")
+                            .font(.system(size: 11, weight: .semibold))
+                    }
+                    .foregroundStyle(.white)
+                    .frame(width: 68, height: 54)
+                    .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel(library.speakingPhraseID == phrase.id ? "停止朗读" : "播放英式英语发音")
+                .accessibilityLabel(isSaved ? "取消收藏表达" : "收藏表达")
+                .frame(width: phraseSaveRevealWidth)
+                .frame(maxHeight: .infinity)
+                .offset(x: phraseSaveRevealWidth + (isPhraseSwipeOpen ? phraseSwipeOffset : 0))
+                .allowsHitTesting(isPhraseSwipeOpen && phraseSwipeOffset < -phraseSaveRevealWidth / 2)
+                .zIndex(1)
+
+                WordFlowLayout(spacing: 5) {
+                    ForEach(Array(phrase.english.split(whereSeparator: \.isWhitespace).enumerated()), id: \.offset) { _, token in
+                        WordTokenButton(token: String(token), color: ink, interactionDisabled: suppressPhraseActions)
+                    }
+                    Button {
+                        guard !suppressPhraseActions else { return }
+                        library.speak(phrase)
+                    } label: {
+                        Image(systemName: library.speakingPhraseID == phrase.id ? "stop.fill" : "speaker.wave.2.fill")
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundStyle(secondary)
+                            .frame(width: 28, height: 30)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(library.speakingPhraseID == phrase.id ? "停止朗读" : "播放英式英语发音")
+                    Button {
+                        guard !suppressPhraseActions else { return }
+                        library.startGrammarAnalysis(for: phrase)
+                    } label: {
+                        Image(systemName: "textformat.abc")
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundStyle(secondary)
+                            .frame(width: 28, height: 30)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("分析英语语法")
+                    .popover(isPresented: grammarPopoverBinding(for: phrase.id), attachmentAnchor: .rect(.bounds), arrowEdge: .top) {
+                        grammarPopover(for: phrase)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 6)
+                .background {
+                    RoundedRectangle(cornerRadius: 11)
+                        .fill(Color.primary.opacity(isPhraseSwipeOpen ? 0.06 : 0))
+                        .padding(-6)
+                }
+                .offset(x: isPhraseSwipeOpen ? phraseSwipeOffset : 0)
+                .contentShape(Rectangle())
             }
-            .background {
-                RoundedRectangle(cornerRadius: 11)
-                    .fill(Color.primary.opacity(isPhraseHighlighted ? 0.08 : 0))
-                    .padding(-6)
-            }
-            .animation(.spring(response: 0.28, dampingFraction: 0.82), value: isPhraseHighlighted)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .clipped()
             .simultaneousGesture(
-                LongPressGesture(minimumDuration: 0.4)
-                    .onEnded { _ in
-                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
-                            activePhraseMenuID = phrase.id
+                DragGesture(minimumDistance: 22)
+                    .onChanged { value in
+                        guard abs(value.translation.width) > max(22, abs(value.translation.height) * 1.6) else { return }
+                        suppressPhraseActions = true
+                        if phraseSwipeDragID != phrase.id {
+                            phraseSwipeDragID = phrase.id
+                            phraseSwipeStartOffset = openPhraseSwipeID == phrase.id ? phraseSwipeOffset : 0
                         }
+                        if openPhraseSwipeID != phrase.id {
+                            guard value.translation.width < 0 else { return }
+                            openPhraseSwipeID = phrase.id
+                        }
+                        phraseSwipeOffset = min(0, max(-phraseSaveRevealWidth, phraseSwipeStartOffset + value.translation.width))
+                    }
+                    .onEnded { value in
+                        if abs(value.translation.width) > max(22, abs(value.translation.height) * 1.6) {
+                            let endingOffset = min(0, max(-phraseSaveRevealWidth, phraseSwipeStartOffset + value.translation.width))
+                            let shouldRemainOpen = phraseSwipeStartOffset < 0
+                                ? endingOffset < -phraseSaveRevealWidth / 2
+                                : value.translation.width < -36
+                            if shouldRemainOpen {
+                                withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) {
+                                    openPhraseSwipeID = phrase.id
+                                    phraseSwipeOffset = -phraseSaveRevealWidth
+                                }
+                            } else {
+                                closePhraseSwipe(phrase.id)
+                            }
+                        }
+                        phraseSwipeDragID = nil
+                        releasePhraseActionSuppressionSoon()
                     }
             )
-            .popover(isPresented: phraseMenuBinding(for: phrase.id), attachmentAnchor: .rect(.bounds), arrowEdge: .top) {
-                Button {
-                    let wasSaved = library.contains(phrase)
-                    library.toggleSaved(phrase)
-                    showToast(wasSaved ? "已取消收藏" : "已收藏")
-                    activePhraseMenuID = nil
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: library.contains(phrase) ? "bookmark.slash" : "bookmark")
-                            .font(.system(size: 15, weight: .medium))
-                        Text(library.contains(phrase) ? "取消收藏" : "收藏表达")
-                            .font(.system(size: 15, weight: .medium))
-                    }
-                    .frame(maxWidth: .infinity, minHeight: 46, alignment: .center)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(ink)
-                .frame(width: 200)
-                .padding(8)
-                .presentationCompactAdaptation(.popover)
-            }
             Text(phrase.note)
                 .font(.system(size: 13))
                 .foregroundStyle(secondary)
@@ -1149,17 +1775,6 @@ struct MainView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func phraseMenuBinding(for id: UUID) -> Binding<Bool> {
-        Binding(
-            get: { activePhraseMenuID == id },
-            set: { isPresented in
-                if !isPresented && activePhraseMenuID == id {
-                    activePhraseMenuID = nil
-                }
-            }
-        )
-    }
-
     private func showToast(_ text: String) {
         withAnimation { toast = text }
         Task {
@@ -1167,27 +1782,112 @@ struct MainView: View {
             withAnimation { toast = nil }
         }
     }
+
+    private func grammarPopoverBinding(for phraseID: UUID) -> Binding<Bool> {
+        Binding(
+            get: { library.activeGrammarPhraseID == phraseID },
+            set: { isPresented in
+                if !isPresented { library.dismissGrammarAnalysis(phraseID: phraseID) }
+            }
+        )
+    }
+
+    private func grammarPopover(for phrase: Phrase) -> some View {
+        VStack(alignment: .center, spacing: 12) {
+            Text("语法分析")
+                .font(.system(size: 17, weight: .semibold))
+            Text(phrase.english)
+                .font(.system(size: 14, weight: .medium, design: .serif))
+                .foregroundStyle(secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            Rectangle()
+                .fill(Color.primary.opacity(0.08))
+                .frame(height: 1)
+            if library.isGrammarAnalysisLoading {
+                ProgressView()
+                Text("正在分析句子结构…")
+                    .font(.system(size: 13))
+                    .foregroundStyle(secondary)
+            } else if let analysis = library.grammarAnalysis {
+                ScrollView {
+                    Text(analysis)
+                        .font(.system(size: 14))
+                        .foregroundStyle(ink)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 240)
+            } else if let error = library.grammarAnalysisError {
+                Text(error)
+                    .font(.system(size: 14))
+                    .foregroundStyle(secondary)
+                    .multilineTextAlignment(.center)
+                Button("重试") {
+                    library.startGrammarAnalysis(for: phrase)
+                }
+                .font(.system(size: 14, weight: .medium))
+            }
+        }
+        .padding(16)
+        .frame(width: 280)
+        .presentationCompactAdaptation(.popover)
+    }
+
+    private func releasePhraseActionSuppressionSoon() {
+        let token = UUID()
+        phraseActionSuppressionToken = token
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            guard phraseActionSuppressionToken == token else { return }
+            suppressPhraseActions = false
+            phraseActionSuppressionToken = nil
+        }
+    }
+
+    private func closePhraseSwipe(_ id: UUID) {
+        guard openPhraseSwipeID == id else { return }
+        withAnimation(.spring(response: 0.32, dampingFraction: 0.86), completionCriteria: .logicallyComplete) {
+            phraseSwipeOffset = 0
+        } completion: {
+            if openPhraseSwipeID == id {
+                openPhraseSwipeID = nil
+            }
+        }
+    }
 }
 
 private struct SavedPhrasesView: View {
     @EnvironmentObject private var library: PhraseLibrary
+    @State private var isSelecting = false
+    @State private var selectedIDs: Set<UUID> = []
 
     var body: some View {
         Group {
             if library.saved.isEmpty {
-                ContentUnavailableView("还没有收藏", systemImage: "bookmark", description: Text("长按喜欢的英文表达即可收藏。"))
+                ContentUnavailableView("还没有收藏", systemImage: "bookmark", description: Text("左滑喜欢的英文表达即可收藏。"))
             } else {
                 List {
                     ForEach(library.saved) { phrase in
-                        VStack(alignment: .leading, spacing: 7) {
-                            Text(phrase.english)
-                                .font(.system(size: 19, weight: .medium, design: .serif))
-                            Text(phrase.chinese)
-                                .font(.system(size: 13))
-                                .foregroundStyle(.secondary)
-                            Text(phrase.note)
-                                .font(.system(size: 13))
-                                .foregroundStyle(.secondary)
+                        HStack(spacing: 12) {
+                            if isSelecting {
+                                Button { toggleSelection(phrase.id) } label: {
+                                    Image(systemName: selectedIDs.contains(phrase.id) ? "checkmark.circle.fill" : "circle")
+                                        .font(.system(size: 21))
+                                        .foregroundStyle(selectedIDs.contains(phrase.id) ? Color.accentColor : Color.secondary)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            VStack(alignment: .leading, spacing: 7) {
+                                Text(phrase.english)
+                                    .font(.system(size: 19, weight: .medium, design: .serif))
+                                Text(phrase.chinese)
+                                    .font(.system(size: 13))
+                                    .foregroundStyle(.secondary)
+                                Text(phrase.note)
+                                    .font(.system(size: 13))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         .padding(.vertical, 6)
                         .contextMenu {
@@ -1203,6 +1903,218 @@ private struct SavedPhrasesView: View {
         .navigationTitle("收藏")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.visible, for: .navigationBar)
+        .toolbar {
+            if !library.saved.isEmpty {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    if isSelecting {
+                        Button("全选") {
+                            selectedIDs = Set(library.saved.map(\.id))
+                        }
+                        Button(role: .destructive) {
+                            library.deleteSavedPhrases(selectedIDs)
+                            selectedIDs.removeAll()
+                            isSelecting = false
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .disabled(selectedIDs.isEmpty)
+                        Button("完成") {
+                            isSelecting = false
+                            selectedIDs.removeAll()
+                        }
+                    } else {
+                        Button("选择") { isSelecting = true }
+                    }
+                }
+            }
+        }
+    }
+
+    private func toggleSelection(_ id: UUID) {
+        if selectedIDs.contains(id) { selectedIDs.remove(id) }
+        else { selectedIDs.insert(id) }
+    }
+}
+
+private struct WordHistoryView: View {
+    @EnvironmentObject private var library: PhraseLibrary
+    @State private var isSelecting = false
+    @State private var selectedIDs: Set<UUID> = []
+
+    var body: some View {
+        Group {
+            if library.wordHistory.isEmpty {
+                ContentUnavailableView("还没有单词记录", systemImage: "text.magnifyingglass", description: Text("查询过的单词会保存在这里。"))
+            } else {
+                List {
+                    ForEach(library.wordHistory) { entry in
+                        HStack(spacing: 12) {
+                            if isSelecting {
+                                Button { toggleSelection(entry.id) } label: {
+                                    Image(systemName: selectedIDs.contains(entry.id) ? "checkmark.circle.fill" : "circle")
+                                        .font(.system(size: 21))
+                                        .foregroundStyle(selectedIDs.contains(entry.id) ? Color.accentColor : Color.secondary)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                                    Text(entry.word)
+                                        .font(.system(size: 20, weight: .semibold, design: .serif))
+                                    Text(entry.ipa)
+                                        .font(.system(size: 14))
+                                        .foregroundStyle(.secondary)
+                                }
+                                Text(entry.meaning)
+                                    .font(.system(size: 15))
+                                Text("查询 \(entry.count) 次 · \(entry.date.formatted(date: .numeric, time: .shortened))")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .padding(.vertical, 5)
+                    }
+                }
+                .listStyle(.plain)
+            }
+        }
+        .navigationTitle("单词记录")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.visible, for: .navigationBar)
+        .toolbar {
+            if !library.wordHistory.isEmpty {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    if isSelecting {
+                        Button("全选") {
+                            selectedIDs = Set(library.wordHistory.map(\.id))
+                        }
+                        Button(role: .destructive) {
+                            library.deleteWordHistory(selectedIDs)
+                            selectedIDs.removeAll()
+                            isSelecting = false
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .disabled(selectedIDs.isEmpty)
+                        Button("完成") {
+                            isSelecting = false
+                            selectedIDs.removeAll()
+                        }
+                    } else {
+                        Button("选择") { isSelecting = true }
+                    }
+                }
+            }
+        }
+    }
+
+    private func toggleSelection(_ id: UUID) {
+        if selectedIDs.contains(id) { selectedIDs.remove(id) }
+        else { selectedIDs.insert(id) }
+    }
+}
+
+private struct GrammarHistoryView: View {
+    @EnvironmentObject private var library: PhraseLibrary
+    @State private var expandedIDs: Set<UUID> = []
+    @State private var isSelecting = false
+    @State private var selectedIDs: Set<UUID> = []
+
+    var body: some View {
+        Group {
+            if library.grammarHistory.isEmpty {
+                ContentUnavailableView("还没有语法记录", systemImage: "text.alignleft", description: Text("分析过的英语句子会保存在这里。"))
+            } else {
+                List {
+                    ForEach(library.grammarHistory) { entry in
+                        HStack(spacing: 12) {
+                            if isSelecting {
+                                Button { toggleSelection(entry.id) } label: {
+                                    Image(systemName: selectedIDs.contains(entry.id) ? "checkmark.circle.fill" : "circle")
+                                        .font(.system(size: 21))
+                                        .foregroundStyle(selectedIDs.contains(entry.id) ? Color.accentColor : Color.secondary)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            VStack(alignment: .leading, spacing: 0) {
+                                Button {
+                                    if expandedIDs.contains(entry.id) { expandedIDs.remove(entry.id) }
+                                    else { expandedIDs.insert(entry.id) }
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        VStack(alignment: .leading, spacing: 6) {
+                                            Text(entry.english)
+                                                .font(.system(size: 17, weight: .medium, design: .serif))
+                                                .fixedSize(horizontal: false, vertical: true)
+                                            Text(entry.chinese)
+                                                .font(.system(size: 13))
+                                                .foregroundStyle(.secondary)
+                                            Text("分析 \(entry.count) 次 · \(entry.date.formatted(date: .numeric, time: .shortened))")
+                                                .font(.system(size: 11))
+                                                .foregroundStyle(.tertiary)
+                                        }
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        Image(systemName: expandedIDs.contains(entry.id) ? "chevron.up" : "chevron.down")
+                                            .font(.system(size: 12, weight: .medium))
+                                            .foregroundStyle(.tertiary)
+                                    }
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+
+                                if expandedIDs.contains(entry.id) {
+                                    Text(entry.analysis)
+                                        .font(.system(size: 14))
+                                        .foregroundStyle(.primary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .padding(.top, 12)
+                                        .padding(.bottom, 4)
+                                }
+                            }
+                            .padding(.vertical, 5)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+                .listStyle(.plain)
+            }
+        }
+        .navigationTitle("语法记录")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.visible, for: .navigationBar)
+        .toolbar {
+            if !library.grammarHistory.isEmpty {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    if isSelecting {
+                        Button("全选") {
+                            selectedIDs = Set(library.grammarHistory.map(\.id))
+                        }
+                        Button(role: .destructive) {
+                            expandedIDs.subtract(selectedIDs)
+                            library.deleteGrammarHistory(selectedIDs)
+                            selectedIDs.removeAll()
+                            isSelecting = false
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .disabled(selectedIDs.isEmpty)
+                        Button("完成") {
+                            isSelecting = false
+                            selectedIDs.removeAll()
+                        }
+                    } else {
+                        Button("选择") { isSelecting = true }
+                    }
+                }
+            }
+        }
+    }
+
+    private func toggleSelection(_ id: UUID) {
+        if selectedIDs.contains(id) { selectedIDs.remove(id) }
+        else { selectedIDs.insert(id) }
     }
 }
 
